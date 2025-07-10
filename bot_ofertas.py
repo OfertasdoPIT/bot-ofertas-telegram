@@ -10,12 +10,11 @@ from telegram import Update, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # --- CONFIGURAÇÃO SEGURA ---
-# O token será lido dos "Secrets" do Replit.
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHANNEL_ID = "@ofertasdopit"
 SEU_ID_ASSOCIADO = "ofertasdopit1-20" 
 
-# Configuração de logging para vermos o que o bot está fazendo
+# Configuração de logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
     level=logging.INFO
@@ -36,7 +35,7 @@ def start_keep_alive_thread():
     t = Thread(target=run_flask)
     t.start()
 
-# --- FUNÇÕES DE SCRAPING (COMPLETAS) ---
+# --- FUNÇÕES DE SCRAPING (COMPLETAS E ATUALIZADAS) ---
 
 def extrair_asin(url):
     match = re.search(r'/(dp|gp/product)/(\w{10})', url)
@@ -72,9 +71,14 @@ def baixar_imagem(url_imagem, nome_arquivo="imagem_produto.jpg"):
         return False
 
 def buscar_dados_produto(url_produto):
+    # Headers aprimorados para parecer mais com um navegador real
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
-        'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
+        'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'DNT': '1',
+        'Upgrade-Insecure-Requests': '1',
     }
     try:
         resposta = requests.get(url_produto, headers=headers, timeout=15)
@@ -96,34 +100,41 @@ def buscar_dados_produto(url_produto):
         else:
             dados['url_imagem'] = tag_imagem.get('src')
     
+    # --- NOVA LÓGICA DE BUSCA DE PREÇO (MAIS ROBUSTA) ---
     dados['preco_atual_completo'] = None
     dados['preco_original_completo'] = None
     dados['desconto_percentual'] = None
 
-    oferta_pday_div = soup.find('div', id=re.compile(r'corePriceDisplay_desktop_feature_div|snsPrice'))
-    if oferta_pday_div:
-        preco_original_tag = oferta_pday_div.find('span', {'data-a-strike': 'true'})
-        if preco_original_tag:
-            dados['preco_original_completo'] = preco_original_tag.find('span', class_='a-offscreen').get_text(strip=True)
-        preco_atual_tag = oferta_pday_div.find('span', class_='a-price-whole')
-        if preco_atual_tag:
-            fracao = oferta_pday_div.find('span', class_='a-price-fraction').get_text(strip=True)
-            dados['preco_atual_completo'] = f"R$ {preco_atual_tag.get_text(strip=True).replace(',', '')},{fracao}"
-        desconto_tag = oferta_pday_div.find('span', class_='a-size-large a-color-price savingPriceOverride aok-align-center reinventPriceSavingsPercentageMargin')
-        if desconto_tag:
-            dados['desconto_percentual'] = desconto_tag.get_text(strip=True).replace('(', '').replace(')', '')
+    # Lista de seletores para o PREÇO ATUAL (do mais específico ao mais genérico)
+    seletores_preco_atual = [
+        '#corePrice_feature_div .a-offscreen',
+        '#snsPrice .a-offscreen',
+        '#priceblock_ourprice',
+        '#priceblock_dealprice',
+        '.priceToPay .a-offscreen',
+        '.a-price.a-text-price .a-offscreen'
+    ]
+    for selector in seletores_preco_atual:
+        tag = soup.select_one(selector)
+        if tag:
+            dados['preco_atual_completo'] = tag.get_text(strip=True)
+            logger.info(f"Preço atual encontrado com o seletor: {selector}")
+            break # Para o loop assim que encontrar o primeiro preço
 
-    if not dados['preco_atual_completo']:
-        buy_box = soup.find('div', {'id': 'centerCol'})
-        if buy_box:
-            preco_atual_tag = buy_box.find('span', class_='a-price-whole')
-            if preco_atual_tag:
-                fracao = buy_box.find('span', class_='a-price-fraction')
-                dados['preco_atual_completo'] = f"R$ {preco_atual_tag.get_text(strip=True)}{fracao.get_text(strip=True) if fracao else '00'}"
-            preco_original_tag = buy_box.find('span', {'class': 'a-offscreen a-text-strike'})
-            if preco_original_tag:
-                dados['preco_original_completo'] = preco_original_tag.get_text(strip=True)
+    # Lista de seletores para o PREÇO ORIGINAL (riscado)
+    seletores_preco_original = [
+        'span[data-a-strike="true"] .a-offscreen',
+        '.basisPrice .a-offscreen',
+        '.a-text-strike'
+    ]
+    for selector in seletores_preco_original:
+        tag = soup.select_one(selector)
+        if tag:
+            dados['preco_original_completo'] = tag.get_text(strip=True)
+            logger.info(f"Preço original encontrado com o seletor: {selector}")
+            break
 
+    # Se o desconto não foi pego diretamente, calcula
     if not dados['desconto_percentual'] and dados.get('preco_original_completo') and dados.get('preco_atual_completo'):
         preco_original_num = limpar_preco(dados['preco_original_completo'])
         preco_atual_num = limpar_preco(dados['preco_atual_completo'])
@@ -154,36 +165,29 @@ def gerar_mensagem_divulgacao(dados, id_associado):
     
     return mensagem.strip()
 
-# --- CÉREBRO DO BOT ---
+# --- CÉREBRO DO BOT (sem alterações) ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Envia uma mensagem de boas-vindas."""
     await update.message.reply_text('Olá! Sou seu robô de ofertas. Me envie um link da Amazon.')
 
 async def processar_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processa o link da Amazon enviado pelo usuário."""
     url = update.message.text
     if 'amazon.com.br' not in url:
         await update.message.reply_text('Por favor, envie um link válido da Amazon Brasil.')
         return
-
     await update.message.reply_text('Entendido! Processando o link, aguarde um momento...')
-    
     try:
         logger.info(f"Processando URL: {url}")
         dados = buscar_dados_produto(url)
         if dados.get('erro'):
             await update.message.reply_text(f"Ocorreu um erro: {dados['erro']}")
             return
-
         mensagem = gerar_mensagem_divulgacao(dados, SEU_ID_ASSOCIADO)
-        
         imagem_path = "imagem_produto.jpg"
         if not baixar_imagem(dados.get('url_imagem'), imagem_path):
             await update.message.reply_text("Não consegui baixar a imagem do produto, postarei apenas o texto.")
             await context.bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=mensagem, parse_mode='Markdown')
             return
-
         logger.info(f"Enviando post para o canal: {TELEGRAM_CHANNEL_ID}")
         with open(imagem_path, 'rb') as foto:
             await context.bot.send_photo(
@@ -192,21 +196,17 @@ async def processar_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption=mensagem,
                 parse_mode='Markdown'
             )
-        
         await update.message.reply_text('✅ Oferta postada com sucesso no seu canal!')
-
     except Exception as e:
         logger.error(f"Erro inesperado no processamento: {e}")
         await update.message.reply_text(f"Ocorreu um erro geral ao processar o link. Detalhes: {e}")
 
-# --- FUNÇÃO PRINCIPAL MODIFICADA ---
+# --- FUNÇÃO PRINCIPAL (sem alterações) ---
 def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.error("ERRO: O Token do Telegram não foi configurado nos Secrets!")
         return
-
     start_keep_alive_thread()
-    
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, processar_link))
