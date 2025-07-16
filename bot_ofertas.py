@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import time
+import shutil # Importamos a biblioteca para procurar programas
 from threading import Thread
 from flask import Flask
 from telegram import Update, InputFile
@@ -35,11 +36,19 @@ def start_keep_alive_thread():
     t = Thread(target=run_flask)
     t.start()
 
-# --- FUNÇÕES DE SCRAPING (COMPLETAS) ---
+# --- FUNÇÕES DE SCRAPING (COM A CORREÇÃO FINAL) ---
+
+def limpar_preco(texto_preco):
+    if not texto_preco: return None
+    try:
+        preco_limpo = re.sub(r'[^\d,]', '', texto_preco).replace(',', '.')
+        return float(preco_limpo)
+    except (ValueError, AttributeError):
+        return None
 
 def baixar_imagem(url_imagem, nome_arquivo="imagem_produto.jpg"):
     if not url_imagem:
-        logger.warning("URL da imagem não encontrada.")
+        logger.warning("URL da imagem não encontrada. Pulando o download.")
         return False
     try:
         resposta = requests.get(url_imagem, stream=True, timeout=15)
@@ -55,23 +64,30 @@ def baixar_imagem(url_imagem, nome_arquivo="imagem_produto.jpg"):
 
 def buscar_dados_produto(url_produto):
     logger.info("Iniciando busca de dados com Selenium...")
+
+    chromedriver_path = shutil.which("chromedriver")
+    if not chromedriver_path:
+        logger.error("CRÍTICO: O executável 'chromedriver' não foi encontrado. Verifique o .replit.")
+        return {'erro': "Falha crítica na configuração do ambiente do robô."}
+    logger.info(f"ChromeDriver encontrado em: {chromedriver_path}")
+
     chrome_options = Options()
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
-    
-    service = Service()
+
+    service = Service(executable_path=chromedriver_path)
     driver = webdriver.Chrome(service=service, options=chrome_options)
-    
+
     dados = {}
     try:
         driver.get(url_produto)
         logger.info("Aguardando página carregar...")
         time.sleep(5)
-        
+
         soup = BeautifulSoup(driver.page_source, 'html.parser')
-        
+
         dados['titulo'] = soup.find('span', {'id': 'productTitle'}).get_text(strip=True) if soup.find('span', {'id': 'productTitle'}) else 'Título não encontrado'
 
         dados['url_imagem'] = None
@@ -81,7 +97,7 @@ def buscar_dados_produto(url_produto):
                 dados['url_imagem'] = list(json.loads(tag_imagem.attrs['data-a-dynamic-image']).keys())[0]
             else:
                 dados['url_imagem'] = tag_imagem.get('src')
-        
+
         dados['preco_atual_completo'] = None
         seletores_preco_atual = ['#corePrice_feature_div .a-offscreen', '#snsPrice .a-offscreen', '#priceblock_ourprice', '#priceblock_dealprice', '.priceToPay .a-offscreen', '.a-price.a-text-price .a-offscreen']
         for selector in seletores_preco_atual:
@@ -99,7 +115,7 @@ def buscar_dados_produto(url_produto):
                 dados['preco_original_completo'] = tag.get_text(strip=True)
                 logger.info(f"Preço original encontrado com o seletor: {selector}")
                 break
-        
+
         dados['avaliacao'] = soup.find('span', {'data-hook': 'rating-out-of-text'}).get_text(strip=True) if soup.find('span', {'data-hook': 'rating-out-of-text'}) else 'Sem avaliações'
         dados['num_avaliacoes'] = soup.find('span', {'id': 'acrCustomerReviewText'}).get_text(strip=True) if soup.find('span', {'id': 'acrCustomerReviewText'}) else ''
 
@@ -109,18 +125,18 @@ def buscar_dados_produto(url_produto):
     finally:
         driver.quit()
         logger.info("Navegador Selenium fechado.")
-        
+
     return dados
 
 def gerar_mensagem_divulgacao(dados, link_do_usuario):
     if dados.get('erro'): return f"Erro ao processar: {dados['erro']}"
     if not dados.get('preco_atual_completo'): return f"Produto '{dados.get('titulo', 'Desconhecido')}' parece estar indisponível ou não foi possível obter o preço."
-    
+
     mensagem = f"🔥 OFERTA IMPERDÍVEL 🔥\n\n"
     mensagem += f"🏷️ *Produto:* {dados['titulo']}\n\n"
     if dados.get('preco_original_completo'): mensagem += f"❌ De: ~{dados['preco_original_completo']}~\n"
     mensagem += f"✅ *Por: {dados['preco_atual_completo']}*\n"
-    
+
     if dados.get('preco_original_completo') and dados.get('preco_atual_completo'):
         preco_original_num = limpar_preco(dados['preco_original_completo'])
         preco_atual_num = limpar_preco(dados['preco_atual_completo'])
@@ -133,7 +149,7 @@ def gerar_mensagem_divulgacao(dados, link_do_usuario):
     mensagem += f"🛒 Estoque limitado! Preços podem mudar a qualquer momento."
     return mensagem.strip()
 
-# --- CÉREBRO DO BOT (COM A LÓGICA DE SEGURANÇA) ---
+# --- CÉREBRO DO BOT ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('Olá! Sou seu robô de ofertas. Me envie um link encurtado da Amazon.')
@@ -143,40 +159,37 @@ async def processar_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not link_encurtado.startswith('http'):
         await update.message.reply_text('Isso não parece um link válido.')
         return
-    
+
     await update.message.reply_text('Entendido! Processando com o navegador... Isso pode levar até 20 segundos.')
-    
+
     try:
         dados = buscar_dados_produto(link_encurtado)
         mensagem = gerar_mensagem_divulgacao(dados, link_encurtado)
-        
-        # --- AQUI ESTÁ A NOVA VERIFICAÇÃO DE SEGURANÇA ---
+
         if "indisponível" in mensagem or "Erro" in mensagem:
             logger.warning(f"Falha ao obter dados. Mensagem de erro: {mensagem}")
-            # Avisa APENAS o usuário no chat privado sobre a falha
             await update.message.reply_text(
                 f"❌ *Falha ao processar o link.*\n\n"
                 f"O robô não conseguiu obter os dados do produto. "
                 f"Isso geralmente acontece por um bloqueio temporário da Amazon (CAPTCHA).\n\n"
                 f"*Nada foi postado no seu canal.* Tente novamente mais tarde ou com outro link."
             )
-            return # Interrompe a execução aqui
+            return
 
-        # Se a verificação passar, continua o processo normal
         imagem_path = "imagem_produto.jpg"
         if baixar_imagem(dados.get('url_imagem'), imagem_path):
             with open(imagem_path, 'rb') as foto:
                 await context.bot.send_photo(chat_id=TELEGRAM_CHANNEL_ID, photo=InputFile(foto), caption=mensagem, parse_mode='Markdown')
-        else: # Se falhar o download da imagem, posta só o texto
+        else:
             await context.bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=mensagem, parse_mode='Markdown')
-        
+
         await update.message.reply_text('✅ Oferta postada com sucesso no seu canal!')
 
     except Exception as e:
         logger.error(f"Erro inesperado no processamento: {e}")
         await update.message.reply_text(f"Ocorreu um erro geral. Detalhes: {e}")
 
-# --- FUNÇÃO PRINCIPAL (sem alterações) ---
+# --- FUNÇÃO PRINCIPAL ---
 def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.error("ERRO: O Token do Telegram não foi configurado nos Secrets!")
