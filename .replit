@@ -1,0 +1,13 @@
+[nix]
+channel = "stable-23_11"
+
+[deployment]
+run = ["python", "bot_ofertas.py"]
+
+[[packages]]
+from = "pkgs.chromium"
+to = "chromium"
+
+[[packages]]
+from = "pkgs.chromedriver"
+to = "chromedriver"
