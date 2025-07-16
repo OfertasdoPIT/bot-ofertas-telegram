@@ -4,6 +4,9 @@ channel = "stable-23_11"
 [deployment]
 run = ["python", "bot_ofertas.py"]
 
+[env]
+PATH = "${pkgs.chromium.out}/bin:${pkgs.chromedriver.out}/bin:${PATH}"
+
 [[packages]]
 from = "pkgs.chromium"
 to = "chromium"
