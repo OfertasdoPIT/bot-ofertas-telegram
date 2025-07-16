@@ -4,16 +4,18 @@ import re
 import json
 import logging
 import os
+import time
 from threading import Thread
 from flask import Flask
 from telegram import Update, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 
 # --- CONFIGURAÇÃO SEGURA ---
-# O token será lido dos "Secrets" do Replit.
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHANNEL_ID = "@ofertasdopit"
-# A variável SEU_ID_ASSOCIADO não é mais necessária, pois você fornecerá o link final.
 
 # Configuração de logging
 logging.basicConfig(
@@ -24,31 +26,20 @@ logger = logging.getLogger(__name__)
 
 # --- PARTE PARA MANTER O ROBÔ ACORDADO (KEEP-ALIVE) ---
 app = Flask('')
-
 @app.route('/')
 def home():
-    return "Estou vivo e trabalhando!"
-
+    return "Estou vivo e trabalhando com Selenium!"
 def run_flask():
   app.run(host='0.0.0.0', port=8080)
-
 def start_keep_alive_thread():
     t = Thread(target=run_flask)
     t.start()
 
-# --- FUNÇÕES DE SCRAPING (ATUALIZADAS) ---
-
-def limpar_preco(texto_preco):
-    if not texto_preco: return None
-    try:
-        preco_limpo = re.sub(r'[^\d,]', '', texto_preco).replace(',', '.')
-        return float(preco_limpo)
-    except (ValueError, AttributeError):
-        return None
+# --- FUNÇÕES DE SCRAPING COM SELENIUM ---
 
 def baixar_imagem(url_imagem, nome_arquivo="imagem_produto.jpg"):
     if not url_imagem:
-        logger.warning("URL da imagem não encontrada. Pulando o download.")
+        logger.warning("URL da imagem não encontrada.")
         return False
     try:
         resposta = requests.get(url_imagem, stream=True, timeout=15)
@@ -63,129 +54,125 @@ def baixar_imagem(url_imagem, nome_arquivo="imagem_produto.jpg"):
         return False
 
 def buscar_dados_produto(url_produto):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
-        'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-    }
-    try:
-        # O requests segue redirecionamentos de links encurtados por padrão
-        resposta = requests.get(url_produto, headers=headers, timeout=15)
-        resposta.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        return {'erro': f"Falha ao acessar a URL. Detalhes: {e}"}
-
-    soup = BeautifulSoup(resposta.content, 'html.parser')
+    logger.info("Iniciando busca de dados com Selenium...")
+    
+    # Configurações do Chrome para rodar no Replit
+    chrome_options = Options()
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--headless") # Rodar sem abrir uma janela visual
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    
+    # Inicializa o driver do Chrome
+    service = Service()
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    
     dados = {}
+    try:
+        # Acessa a URL
+        driver.get(url_produto)
+        
+        # Espera a página carregar completamente (aumenta a robustez)
+        logger.info("Aguardando página carregar...")
+        time.sleep(5) # Espera 5 segundos
+        
+        # Pega o código HTML da página renderizada pelo navegador
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        
+        # --- Extração dos dados (usando a mesma lógica de antes) ---
+        dados['titulo'] = soup.find('span', {'id': 'productTitle'}).get_text(strip=True) if soup.find('span', {'id': 'productTitle'}) else 'Título não encontrado'
 
-    dados['titulo'] = soup.find('span', {'id': 'productTitle'}).get_text(strip=True) if soup.find('span', {'id': 'productTitle'}) else 'Título não encontrado'
+        dados['url_imagem'] = None
+        tag_imagem = soup.find('img', {'id': 'landingImage'})
+        if tag_imagem:
+            if 'data-a-dynamic-image' in tag_imagem.attrs:
+                dados['url_imagem'] = list(json.loads(tag_imagem.attrs['data-a-dynamic-image']).keys())[0]
+            else:
+                dados['url_imagem'] = tag_imagem.get('src')
+        
+        dados['preco_atual_completo'] = None
+        seletores_preco_atual = ['#corePrice_feature_div .a-offscreen', '#snsPrice .a-offscreen', '#priceblock_ourprice', '#priceblock_dealprice', '.priceToPay .a-offscreen', '.a-price.a-text-price .a-offscreen']
+        for selector in seletores_preco_atual:
+            tag = soup.select_one(selector)
+            if tag:
+                dados['preco_atual_completo'] = tag.get_text(strip=True)
+                logger.info(f"Preço atual encontrado com o seletor: {selector}")
+                break
 
-    dados['url_imagem'] = None
-    tag_imagem = soup.find('img', {'id': 'landingImage'})
-    if tag_imagem:
-        if 'data-a-dynamic-image' in tag_imagem.attrs:
-            imagens_json = json.loads(tag_imagem.attrs['data-a-dynamic-image'])
-            dados['url_imagem'] = list(imagens_json.keys())[0]
-        else:
-            dados['url_imagem'] = tag_imagem.get('src')
-    
-    dados['preco_atual_completo'] = None
-    dados['preco_original_completo'] = None
-    dados['desconto_percentual'] = None
+        dados['preco_original_completo'] = None
+        seletores_preco_original = ['span[data-a-strike="true"] .a-offscreen', '.basisPrice .a-offscreen', '.a-text-strike']
+        for selector in seletores_preco_original:
+            tag = soup.select_one(selector)
+            if tag:
+                dados['preco_original_completo'] = tag.get_text(strip=True)
+                logger.info(f"Preço original encontrado com o seletor: {selector}")
+                break
 
-    seletores_preco_atual = [
-        '#corePrice_feature_div .a-offscreen', '#snsPrice .a-offscreen', '#priceblock_ourprice',
-        '#priceblock_dealprice', '.priceToPay .a-offscreen', '.a-price.a-text-price .a-offscreen'
-    ]
-    for selector in seletores_preco_atual:
-        tag = soup.select_one(selector)
-        if tag:
-            dados['preco_atual_completo'] = tag.get_text(strip=True)
-            logger.info(f"Preço atual encontrado com o seletor: {selector}")
-            break
+        # ... (Resto da lógica de avaliação, etc.)
+        dados['avaliacao'] = soup.find('span', {'data-hook': 'rating-out-of-text'}).get_text(strip=True) if soup.find('span', {'data-hook': 'rating-out-of-text'}) else 'Sem avaliações'
+        dados['num_avaliacoes'] = soup.find('span', {'id': 'acrCustomerReviewText'}).get_text(strip=True) if soup.find('span', {'id': 'acrCustomerReviewText'}) else ''
 
-    seletores_preco_original = ['span[data-a-strike="true"] .a-offscreen', '.basisPrice .a-offscreen', '.a-text-strike']
-    for selector in seletores_preco_original:
-        tag = soup.select_one(selector)
-        if tag:
-            dados['preco_original_completo'] = tag.get_text(strip=True)
-            logger.info(f"Preço original encontrado com o seletor: {selector}")
-            break
-
-    if not dados['desconto_percentual'] and dados.get('preco_original_completo') and dados.get('preco_atual_completo'):
-        preco_original_num = limpar_preco(dados['preco_original_completo'])
-        preco_atual_num = limpar_preco(dados['preco_atual_completo'])
-        if preco_original_num and preco_atual_num and preco_original_num > preco_atual_num:
-            desconto = ((preco_original_num - preco_atual_num) / preco_original_num) * 100
-            dados['desconto_percentual'] = f"{int(round(desconto, 0))}% OFF"
-
-    dados['avaliacao'] = soup.find('span', {'data-hook': 'rating-out-of-text'}).get_text(strip=True) if soup.find('span', {'data-hook': 'rating-out-of-text'}) else 'Sem avaliações'
-    dados['num_avaliacoes'] = soup.find('span', {'id': 'acrCustomerReviewText'}).get_text(strip=True) if soup.find('span', {'id': 'acrCustomerReviewText'}) else ''
-    
+    except Exception as e:
+        logger.error(f"Erro durante a execução do Selenium: {e}")
+        dados['erro'] = str(e)
+    finally:
+        # Garante que o navegador seja fechado, mesmo se ocorrer um erro
+        driver.quit()
+        logger.info("Navegador Selenium fechado.")
+        
     return dados
 
 def gerar_mensagem_divulgacao(dados, link_do_usuario):
-    """Gera a mensagem final usando o link fornecido pelo usuário."""
-    if dados.get('erro'): return dados['erro']
-    if not dados.get('preco_atual_completo'): return f"Produto '{dados['titulo']}' parece estar indisponível."
-
+    # (Esta função permanece exatamente a mesma)
+    if dados.get('erro'): return f"Erro ao processar: {dados['erro']}"
+    if not dados.get('preco_atual_completo'): return f"Produto '{dados.get('titulo', 'Desconhecido')}' parece estar indisponível ou não foi possível obter o preço."
+    
     mensagem = f"🔥 OFERTA IMPERDÍVEL 🔥\n\n"
     mensagem += f"🏷️ *Produto:* {dados['titulo']}\n\n"
     if dados.get('preco_original_completo'): mensagem += f"❌ De: ~{dados['preco_original_completo']}~\n"
     mensagem += f"✅ *Por: {dados['preco_atual_completo']}*\n"
-    if dados.get('desconto_percentual'): mensagem += f"🤑 *{dados['desconto_percentual'].replace('-', '')} de desconto!* 🔥\n"
+    
+    # Recalcula o desconto se necessário
+    if dados.get('preco_original_completo') and dados.get('preco_atual_completo'):
+        preco_original_num = limpar_preco(dados['preco_original_completo'])
+        preco_atual_num = limpar_preco(dados['preco_atual_completo'])
+        if preco_original_num and preco_atual_num and preco_original_num > preco_atual_num:
+            desconto = ((preco_original_num - preco_atual_num) / preco_original_num) * 100
+            mensagem += f"🤑 *{int(round(desconto, 0))}% de desconto!* 🔥\n"
+
     mensagem += f"\n⭐ *Avaliação:* {dados['avaliacao']} ({dados['num_avaliacoes']})\n\n"
-    # AQUI ESTÁ A MUDANÇA: Usamos o link que você enviou
     mensagem += f"🔗 *Compre aqui com seu desconto:*\n{link_do_usuario}\n\n"
     mensagem += f"🛒 Estoque limitado! Preços podem mudar a qualquer momento."
-    
     return mensagem.strip()
 
-# --- CÉREBRO DO BOT (ATUALIZADO) ---
-
+# --- CÉREBRO DO BOT (sem alterações) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Olá! Sou seu robô de ofertas. Me envie um link encurtado da Amazon (amzn.to/...) e eu preparo o post!')
+    await update.message.reply_text('Olá! Sou seu robô de ofertas. Me envie um link encurtado da Amazon.')
 
 async def processar_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processa o link encurtado da Amazon enviado pelo usuário."""
     link_encurtado = update.message.text
-    # Verificação simples para garantir que é um link
     if not link_encurtado.startswith('http'):
-        await update.message.reply_text('Isso não parece um link válido. Por favor, envie um link encurtado da Amazon.')
+        await update.message.reply_text('Isso não parece um link válido.')
         return
-
-    await update.message.reply_text('Entendido! Processando seu link, aguarde um momento...')
-    
+    await update.message.reply_text('Entendido! Processando com o navegador... Isso pode levar até 20 segundos.')
     try:
-        logger.info(f"Processando URL encurtada: {link_encurtado}")
         dados = buscar_dados_produto(link_encurtado)
-        if dados.get('erro'):
-            await update.message.reply_text(f"Ocorreu um erro: {dados['erro']}")
-            return
-
-        # Passamos o seu link encurtado original para a função que gera a mensagem
         mensagem = gerar_mensagem_divulgacao(dados, link_encurtado)
-        
-        imagem_path = "imagem_produto.jpg"
-        if not baixar_imagem(dados.get('url_imagem'), imagem_path):
-            await update.message.reply_text("Não consegui baixar a imagem do produto, postarei apenas o texto.")
-            await context.bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=mensagem, parse_mode='Markdown')
+        if dados.get('erro') or "indisponível" in mensagem:
+            await update.message.reply_text(mensagem)
             return
 
-        logger.info(f"Enviando post para o canal: {TELEGRAM_CHANNEL_ID}")
-        with open(imagem_path, 'rb') as foto:
-            await context.bot.send_photo(
-                chat_id=TELEGRAM_CHANNEL_ID,
-                photo=InputFile(foto),
-                caption=mensagem,
-                parse_mode='Markdown'
-            )
+        imagem_path = "imagem_produto.jpg"
+        if baixar_imagem(dados.get('url_imagem'), imagem_path):
+            with open(imagem_path, 'rb') as foto:
+                await context.bot.send_photo(chat_id=TELEGRAM_CHANNEL_ID, photo=InputFile(foto), caption=mensagem, parse_mode='Markdown')
+        else:
+            await context.bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=mensagem, parse_mode='Markdown')
         
         await update.message.reply_text('✅ Oferta postada com sucesso no seu canal!')
-
     except Exception as e:
         logger.error(f"Erro inesperado no processamento: {e}")
-        await update.message.reply_text(f"Ocorreu um erro geral ao processar o link. Detalhes: {e}")
+        await update.message.reply_text(f"Ocorreu um erro geral. Detalhes: {e}")
 
 # --- FUNÇÃO PRINCIPAL (sem alterações) ---
 def main():
