@@ -35,7 +35,7 @@ def start_keep_alive_thread():
     t = Thread(target=run_flask)
     t.start()
 
-# --- FUNÇÕES DE SCRAPING COM SELENIUM ---
+# --- FUNÇÕES DE SCRAPING (COMPLETAS) ---
 
 def baixar_imagem(url_imagem, nome_arquivo="imagem_produto.jpg"):
     if not url_imagem:
@@ -55,31 +55,23 @@ def baixar_imagem(url_imagem, nome_arquivo="imagem_produto.jpg"):
 
 def buscar_dados_produto(url_produto):
     logger.info("Iniciando busca de dados com Selenium...")
-    
-    # Configurações do Chrome para rodar no Replit
     chrome_options = Options()
     chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--headless") # Rodar sem abrir uma janela visual
+    chrome_options.add_argument("--headless")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     
-    # Inicializa o driver do Chrome
     service = Service()
     driver = webdriver.Chrome(service=service, options=chrome_options)
     
     dados = {}
     try:
-        # Acessa a URL
         driver.get(url_produto)
-        
-        # Espera a página carregar completamente (aumenta a robustez)
         logger.info("Aguardando página carregar...")
-        time.sleep(5) # Espera 5 segundos
+        time.sleep(5)
         
-        # Pega o código HTML da página renderizada pelo navegador
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         
-        # --- Extração dos dados (usando a mesma lógica de antes) ---
         dados['titulo'] = soup.find('span', {'id': 'productTitle'}).get_text(strip=True) if soup.find('span', {'id': 'productTitle'}) else 'Título não encontrado'
 
         dados['url_imagem'] = None
@@ -107,8 +99,7 @@ def buscar_dados_produto(url_produto):
                 dados['preco_original_completo'] = tag.get_text(strip=True)
                 logger.info(f"Preço original encontrado com o seletor: {selector}")
                 break
-
-        # ... (Resto da lógica de avaliação, etc.)
+        
         dados['avaliacao'] = soup.find('span', {'data-hook': 'rating-out-of-text'}).get_text(strip=True) if soup.find('span', {'data-hook': 'rating-out-of-text'}) else 'Sem avaliações'
         dados['num_avaliacoes'] = soup.find('span', {'id': 'acrCustomerReviewText'}).get_text(strip=True) if soup.find('span', {'id': 'acrCustomerReviewText'}) else ''
 
@@ -116,14 +107,12 @@ def buscar_dados_produto(url_produto):
         logger.error(f"Erro durante a execução do Selenium: {e}")
         dados['erro'] = str(e)
     finally:
-        # Garante que o navegador seja fechado, mesmo se ocorrer um erro
         driver.quit()
         logger.info("Navegador Selenium fechado.")
         
     return dados
 
 def gerar_mensagem_divulgacao(dados, link_do_usuario):
-    # (Esta função permanece exatamente a mesma)
     if dados.get('erro'): return f"Erro ao processar: {dados['erro']}"
     if not dados.get('preco_atual_completo'): return f"Produto '{dados.get('titulo', 'Desconhecido')}' parece estar indisponível ou não foi possível obter o preço."
     
@@ -132,7 +121,6 @@ def gerar_mensagem_divulgacao(dados, link_do_usuario):
     if dados.get('preco_original_completo'): mensagem += f"❌ De: ~{dados['preco_original_completo']}~\n"
     mensagem += f"✅ *Por: {dados['preco_atual_completo']}*\n"
     
-    # Recalcula o desconto se necessário
     if dados.get('preco_original_completo') and dados.get('preco_atual_completo'):
         preco_original_num = limpar_preco(dados['preco_original_completo'])
         preco_atual_num = limpar_preco(dados['preco_atual_completo'])
@@ -145,7 +133,8 @@ def gerar_mensagem_divulgacao(dados, link_do_usuario):
     mensagem += f"🛒 Estoque limitado! Preços podem mudar a qualquer momento."
     return mensagem.strip()
 
-# --- CÉREBRO DO BOT (sem alterações) ---
+# --- CÉREBRO DO BOT (COM A LÓGICA DE SEGURANÇA) ---
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('Olá! Sou seu robô de ofertas. Me envie um link encurtado da Amazon.')
 
@@ -154,22 +143,35 @@ async def processar_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not link_encurtado.startswith('http'):
         await update.message.reply_text('Isso não parece um link válido.')
         return
+    
     await update.message.reply_text('Entendido! Processando com o navegador... Isso pode levar até 20 segundos.')
+    
     try:
         dados = buscar_dados_produto(link_encurtado)
         mensagem = gerar_mensagem_divulgacao(dados, link_encurtado)
-        if dados.get('erro') or "indisponível" in mensagem:
-            await update.message.reply_text(mensagem)
-            return
+        
+        # --- AQUI ESTÁ A NOVA VERIFICAÇÃO DE SEGURANÇA ---
+        if "indisponível" in mensagem or "Erro" in mensagem:
+            logger.warning(f"Falha ao obter dados. Mensagem de erro: {mensagem}")
+            # Avisa APENAS o usuário no chat privado sobre a falha
+            await update.message.reply_text(
+                f"❌ *Falha ao processar o link.*\n\n"
+                f"O robô não conseguiu obter os dados do produto. "
+                f"Isso geralmente acontece por um bloqueio temporário da Amazon (CAPTCHA).\n\n"
+                f"*Nada foi postado no seu canal.* Tente novamente mais tarde ou com outro link."
+            )
+            return # Interrompe a execução aqui
 
+        # Se a verificação passar, continua o processo normal
         imagem_path = "imagem_produto.jpg"
         if baixar_imagem(dados.get('url_imagem'), imagem_path):
             with open(imagem_path, 'rb') as foto:
                 await context.bot.send_photo(chat_id=TELEGRAM_CHANNEL_ID, photo=InputFile(foto), caption=mensagem, parse_mode='Markdown')
-        else:
+        else: # Se falhar o download da imagem, posta só o texto
             await context.bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=mensagem, parse_mode='Markdown')
         
         await update.message.reply_text('✅ Oferta postada com sucesso no seu canal!')
+
     except Exception as e:
         logger.error(f"Erro inesperado no processamento: {e}")
         await update.message.reply_text(f"Ocorreu um erro geral. Detalhes: {e}")
